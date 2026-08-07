@@ -12,6 +12,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var uiState: UIState = .loadingModel
     private var lastTranscript = ""
 
+    // Live input meter shown while recording (see MARK: - Level meter).
+    private var meterTimer: Timer?
+    private var meterHistory: [Float] = []
+    private var silentTicks = 0
+    private weak var statusMenuItem: NSMenuItem?
+
     private enum UIState {
         case loadingModel
         case ready
@@ -112,21 +118,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         button?.image = Mascot.menuBar
         button?.imagePosition = .imageLeading
 
+        // Only the recording state animates; everything else is a static word.
+        if case .recording = state {} else { stopMeter() }
+
         switch state {
         case .loadingModel:
-            button?.title = " loading…"
+            setTitle(" loading…")
             menu.addItem(disabled("Downloading / loading model…"))
         case .ready:
-            button?.title = ""
+            setTitle("")
             menu.addItem(disabled("Ready — \(shortcut) to dictate"))
         case .recording:
-            button?.title = " listening…"
-            menu.addItem(disabled("Recording — \(shortcut) to stop"))
+            startMeter()   // draws the title itself, and keeps redrawing it
+            let item = disabled(recordingStatusText)
+            statusMenuItem = item
+            menu.addItem(item)
         case .transcribing:
-            button?.title = " transcribing…"
+            setTitle(" transcribing…")
             menu.addItem(disabled("Transcribing…"))
         case let .error(message):
-            button?.title = " error"
+            setTitle(" error")
             menu.addItem(disabled("Error: \(message)"))
         }
 
@@ -168,6 +179,85 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(quit)
 
         statusItem.menu = menu
+    }
+
+    // MARK: - Level meter
+
+    // A scrolling bar-graph of recent mic levels, drawn with block characters beside
+    // the mascot. A dead input (AirPods gone, lid shut, wrong device selected) shows a
+    // flat line instead of a moving waveform, so it's obvious before you stop talking.
+    private static let meterBarCount = 8
+    private static let meterInterval = 0.08
+    private static let meterBlocks = Array("▁▂▃▄▅▆▇█")
+    /// Peaks below this are treated as digital silence (a muted device delivers exact zeros).
+    private static let silenceThreshold: Float = 0.002
+    /// How long the input must stay silent before we call it out in words.
+    private static let silenceGrace = 1.5
+
+    private var meterIsSilent: Bool {
+        Double(silentTicks) * Self.meterInterval >= Self.silenceGrace
+    }
+
+    private var recordingStatusText: String {
+        meterIsSilent
+            ? "No audio reaching the mic — check your input device"
+            : "Recording — \(HotkeyStore.shared.shortcut.display) to stop"
+    }
+
+    private func startMeter() {
+        guard meterTimer == nil else { return }
+        meterHistory = Array(repeating: 0, count: Self.meterBarCount)
+        silentTicks = 0
+        drawMeter()
+        // .common so the meter keeps animating while the menu is open.
+        let timer = Timer(timeInterval: Self.meterInterval, repeats: true) { [weak self] _ in
+            self?.tickMeter()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        meterTimer = timer
+    }
+
+    private func stopMeter() {
+        meterTimer?.invalidate()
+        meterTimer = nil
+    }
+
+    private func tickMeter() {
+        guard recorder.isRecording else { stopMeter(); return }
+        let level = recorder.level
+        let wasSilent = meterIsSilent
+        silentTicks = level < Self.silenceThreshold ? silentTicks + 1 : 0
+        meterHistory.removeFirst()
+        meterHistory.append(level)
+        drawMeter()
+        // Keep the menu's wording in sync when audio drops out or comes back. Edit the
+        // existing item rather than re-rendering, which would close an open menu.
+        if meterIsSilent != wasSilent { statusMenuItem?.title = recordingStatusText }
+    }
+
+    private func drawMeter() {
+        let bars = String(meterHistory.map { Self.meterBlocks[Self.barIndex(for: $0)] })
+        let silent = meterIsSilent
+        setTitle(" " + bars + (silent ? " no audio" : ""),
+                 color: silent ? .systemRed : nil)
+    }
+
+    /// Map a linear peak amplitude onto a bar height, on a dB scale so quiet speech
+    /// still visibly moves. -55 dB and below is the flat bar; -5 dB and up is full.
+    private static func barIndex(for level: Float) -> Int {
+        guard level >= silenceThreshold else { return 0 }
+        let db = 20 * log10(level)
+        let fraction = (Double(db) + 55) / 50
+        return min(meterBlocks.count - 1, max(0, Int((fraction * Double(meterBlocks.count - 1)).rounded())))
+    }
+
+    /// Titles use a monospaced font so the bars keep a fixed width and don't jitter.
+    private func setTitle(_ title: String, color: NSColor? = nil) {
+        var attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedSystemFont(ofSize: NSFont.systemFontSize(for: .small), weight: .regular)
+        ]
+        if let color { attributes[.foregroundColor] = color }
+        statusItem.button?.attributedTitle = NSAttributedString(string: title, attributes: attributes)
     }
 
     private func disabled(_ title: String) -> NSMenuItem {

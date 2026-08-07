@@ -14,12 +14,21 @@ final class Recorder {
     private var converter: AVAudioConverter?
     private let bufferQueue = DispatchQueue(label: "dictat.recorder.buffer")
     private var samples: [Float] = []
+    private var currentLevel: Float = 0
     private(set) var isRecording = false
+
+    /// Peak amplitude (0…1) of the most recent captured chunk. Stays at 0 when the
+    /// selected input is muted or delivering no audio at all — which is exactly the
+    /// case the menu-bar meter needs to make visible.
+    var level: Float { bufferQueue.sync { currentLevel } }
 
     /// Begin capturing. Throws if the audio engine can't start.
     func start() throws {
         guard !isRecording else { return }
-        bufferQueue.sync { samples.removeAll(keepingCapacity: true) }
+        bufferQueue.sync {
+            samples.removeAll(keepingCapacity: true)
+            currentLevel = 0
+        }
 
         let input = engine.inputNode
         let inputFormat = input.inputFormat(forBus: 0)
@@ -42,7 +51,10 @@ final class Recorder {
         engine.stop()
         isRecording = false
         converter = nil
-        return bufferQueue.sync { samples }
+        return bufferQueue.sync {
+            currentLevel = 0
+            return samples
+        }
     }
 
     // MARK: - Private
@@ -69,6 +81,10 @@ final class Recorder {
         guard error == nil, let channel = out.floatChannelData?[0], out.frameLength > 0 else { return }
 
         let chunk = Array(UnsafeBufferPointer(start: channel, count: Int(out.frameLength)))
-        bufferQueue.sync { samples.append(contentsOf: chunk) }
+        let peak = chunk.reduce(Float(0)) { max($0, abs($1)) }
+        bufferQueue.sync {
+            samples.append(contentsOf: chunk)
+            currentLevel = peak
+        }
     }
 }
